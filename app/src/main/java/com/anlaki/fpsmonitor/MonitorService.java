@@ -10,7 +10,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.ServiceConnection;
+import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.IBinder;
@@ -20,11 +22,14 @@ import android.view.Gravity;
 import android.view.Display;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
+import android.widget.SeekBar;
+import android.widget.TextView;
 
 import java.util.ArrayList;
 import java.util.Date;
@@ -41,8 +46,14 @@ public final class MonitorService extends Service {
     public static final String ACTION_STOP = "com.anlaki.fpsmonitor.STOP";
     public static final String ACTION_NOTE = "com.anlaki.fpsmonitor.NOTE";
     public static final String ACTION_SET_LOGGING = "com.anlaki.fpsmonitor.SET_LOGGING";
+    public static final String ACTION_SET_SCALE = "com.anlaki.fpsmonitor.SET_SCALE";
     public static final String EXTRA_NOTE = "note";
     public static final String EXTRA_ENABLED = "enabled";
+    public static final String EXTRA_SCALE = "scale";
+    public static final String PREF_OVERLAY_SCALE = "overlay_scale";
+    public static final int OVERLAY_SCALE_MIN = 50;
+    public static final int OVERLAY_SCALE_MAX = 200;
+    public static final int OVERLAY_SCALE_DEFAULT = 100;
     private static final String CHANNEL_ID = "monitor";
     private static final int NOTIFICATION_ID = 1;
 
@@ -52,12 +63,18 @@ public final class MonitorService extends Service {
     private WindowManager windows;
     private WindowManager.LayoutParams overlayParams;
     private LinearLayout overlay;
+    private LinearLayout optionsPanel;
     private Button fpsButton;
     private RadioGroup layerChoices;
+    private TextView overlaySizeLabel;
+    private SeekBar overlaySizeSlider;
     private String currentPackage;
     private String lastLoggedForeground;
     private String selectedLayer;
     private List<String> shownLayerKeys = new ArrayList<>();
+    private boolean optionsExpanded;
+    private int overlayScalePercent = OVERLAY_SCALE_DEFAULT;
+    private int touchSlop;
     private boolean stopping;
     private boolean binding;
     private volatile boolean loggingEnabled;
@@ -128,6 +145,8 @@ public final class MonitorService extends Service {
             appendDebug("User action: " + intent.getStringExtra(EXTRA_NOTE));
         } else if (intent != null && ACTION_SET_LOGGING.equals(intent.getAction())) {
             setDebugLogging(intent.getBooleanExtra(EXTRA_ENABLED, true));
+        } else if (intent != null && ACTION_SET_SCALE.equals(intent.getAction())) {
+            setOverlayScale(intent.getIntExtra(EXTRA_SCALE, OVERLAY_SCALE_DEFAULT));
         }
         return START_NOT_STICKY;
     }
@@ -243,7 +262,6 @@ public final class MonitorService extends Service {
     private void display(String foreground, List<LayerStat> layers) {
         if (foreground == null) {
             fpsButton.setText("No foreground app");
-            layerChoices.setVisibility(View.GONE);
             return;
         }
         if (!foreground.equals(currentPackage)) {
@@ -253,7 +271,6 @@ public final class MonitorService extends Service {
         }
         if (layers.isEmpty()) {
             fpsButton.setText("Idle / no data");
-            layerChoices.setVisibility(View.GONE);
             return;
         }
 
@@ -266,11 +283,12 @@ public final class MonitorService extends Service {
                 }
             }
         }
-        double shownFps = TimeStatsParser.displayFps(chosen.fps, displayRefreshRate());
+        double refreshRate = displayRefreshRate();
+        double shownFps = TimeStatsParser.displayFps(chosen.fps, refreshRate);
         if (Math.abs(shownFps - chosen.fps) > 0.01) {
             appendDebug(String.format(Locale.US,
                     "Display correction: measured=%.3f; refresh=%.3f; shown=%.3f",
-                    chosen.fps, displayRefreshRate(), shownFps));
+                    chosen.fps, refreshRate, shownFps));
         }
         fpsButton.setText(String.format(Locale.US, "%.1f FPS", shownFps));
         updateChoices(layers);
@@ -289,7 +307,8 @@ public final class MonitorService extends Service {
             for (int i = 1; i < layerChoices.getChildCount() && i <= layers.size(); i++) {
                 RadioButton item = (RadioButton) layerChoices.getChildAt(i);
                 LayerStat layer = layers.get(i - 1);
-                item.setText(layer.shortName() + String.format(Locale.US, "  %.1f", layer.fps));
+                double fps = TimeStatsParser.displayFps(layer.fps, displayRefreshRate());
+                item.setText(layer.shortName() + String.format(Locale.US, "  %.1f", fps));
             }
             return;
         }
@@ -301,6 +320,7 @@ public final class MonitorService extends Service {
         automatic.setText("Auto");
         automatic.setId(View.generateViewId());
         automatic.setTag(null);
+        applyRadioScale(automatic);
         layerChoices.addView(automatic);
         if (selectedLayer == null) automatic.setChecked(true);
 
@@ -308,11 +328,12 @@ public final class MonitorService extends Service {
             RadioButton item = new RadioButton(this);
             item.setId(View.generateViewId());
             item.setTag(layer.stableName);
-            item.setText(layer.shortName() + String.format(Locale.US, "  %.1f", layer.fps));
+            double fps = TimeStatsParser.displayFps(layer.fps, displayRefreshRate());
+            item.setText(layer.shortName() + String.format(Locale.US, "  %.1f", fps));
+            applyRadioScale(item);
             if (layer.stableName.equals(selectedLayer)) item.setChecked(true);
             layerChoices.addView(item);
         }
-        layerChoices.setVisibility(layers.size() > 1 ? View.VISIBLE : View.GONE);
         layerChoices.setOnCheckedChangeListener((group, checkedId) -> {
             View checked = group.findViewById(checkedId);
             selectedLayer = checked == null ? null : (String) checked.getTag();
@@ -329,12 +350,44 @@ public final class MonitorService extends Service {
         fpsButton = new Button(this);
         fpsButton.setText("Connecting…");
         fpsButton.setAllCaps(false);
+        fpsButton.setOnClickListener(view -> toggleOptionsPanel());
         overlay.addView(fpsButton);
 
         layerChoices = new RadioGroup(this);
         layerChoices.setOrientation(RadioGroup.VERTICAL);
-        layerChoices.setVisibility(View.GONE);
-        overlay.addView(layerChoices);
+
+        overlaySizeLabel = new TextView(this);
+        overlaySizeLabel.setTextColor(Color.WHITE);
+
+        overlaySizeSlider = new SeekBar(this);
+        overlaySizeSlider.setMin(OVERLAY_SCALE_MIN);
+        overlaySizeSlider.setMax(OVERLAY_SCALE_MAX);
+        overlaySizeSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress,
+                                                     boolean fromUser) {
+                overlaySizeLabel.setText("Overlay size: " + progress + "%");
+            }
+
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                setOverlayScale(seekBar.getProgress());
+            }
+        });
+
+        optionsPanel = new LinearLayout(this);
+        optionsPanel.setOrientation(LinearLayout.VERTICAL);
+        optionsPanel.setVisibility(View.GONE);
+        optionsPanel.setPadding(dp(10), dp(8), dp(10), dp(10));
+        GradientDrawable panelBackground = new GradientDrawable();
+        panelBackground.setColor(0xE6000000);
+        panelBackground.setCornerRadius(dp(10));
+        panelBackground.setStroke(dp(1), 0x99FFFFFF);
+        optionsPanel.setBackground(panelBackground);
+        optionsPanel.addView(layerChoices);
+        optionsPanel.addView(overlaySizeLabel);
+        optionsPanel.addView(overlaySizeSlider);
+        overlay.addView(optionsPanel);
 
         overlayParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -347,13 +400,57 @@ public final class MonitorService extends Service {
         overlayParams.x = dp(12);
         overlayParams.y = dp(80);
 
+        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        int savedScale = getSharedPreferences("state", MODE_PRIVATE)
+                .getInt(PREF_OVERLAY_SCALE, OVERLAY_SCALE_DEFAULT);
+        setOverlayScale(savedScale);
         fpsButton.setOnTouchListener(new DragListener());
         windows.addView(overlay, overlayParams);
+    }
+
+    private void toggleOptionsPanel() {
+        optionsExpanded = !optionsExpanded;
+        optionsPanel.setVisibility(optionsExpanded ? View.VISIBLE : View.GONE);
+        appendDebug("User action: overlay options " + (optionsExpanded ? "opened" : "closed")
+                + "; available layers=" + Math.max(0, layerChoices.getChildCount() - 1));
+    }
+
+    private void setOverlayScale(int requestedPercent) {
+        int scale = Math.max(OVERLAY_SCALE_MIN, Math.min(OVERLAY_SCALE_MAX, requestedPercent));
+        overlaySizeSlider.setProgress(scale);
+        overlayScalePercent = scale;
+        getSharedPreferences("state", MODE_PRIVATE).edit()
+                .putInt(PREF_OVERLAY_SCALE, overlayScalePercent).apply();
+        float factor = overlayScalePercent / 100f;
+        fpsButton.setTextSize(14f * factor);
+        fpsButton.setMinimumHeight(dp(Math.round(48f * factor)));
+        fpsButton.setPadding(dp(Math.round(16f * factor)), 0,
+                dp(Math.round(16f * factor)), 0);
+        for (int index = 0; index < layerChoices.getChildCount(); index++) {
+            applyRadioScale((RadioButton) layerChoices.getChildAt(index));
+        }
+        overlaySizeLabel.setText("Overlay size: " + overlayScalePercent + "%");
+        overlaySizeLabel.setTextSize(14f * factor);
+        overlaySizeSlider.setMinimumHeight(dp(Math.round(40f * factor)));
+        overlaySizeSlider.setLayoutParams(new LinearLayout.LayoutParams(
+                dp(Math.round(190f * factor)), LinearLayout.LayoutParams.WRAP_CONTENT));
+        overlay.requestLayout();
+        appendDebug("User action: overlay size=" + overlayScalePercent + "%");
+    }
+
+    private void applyRadioScale(RadioButton item) {
+        float factor = overlayScalePercent / 100f;
+        item.setTextColor(Color.WHITE);
+        item.setTextSize(14f * factor);
+        item.setMinimumHeight(dp(Math.round(40f * factor)));
+        item.setPadding(dp(Math.round(8f * factor)), 0,
+                dp(Math.round(8f * factor)), 0);
     }
 
     private final class DragListener implements View.OnTouchListener {
         private int startX, startY;
         private float downX, downY;
+        private boolean moved;
 
         @Override public boolean onTouch(View view, MotionEvent event) {
             switch (event.getActionMasked()) {
@@ -362,16 +459,25 @@ public final class MonitorService extends Service {
                     startY = overlayParams.y;
                     downX = event.getRawX();
                     downY = event.getRawY();
+                    moved = false;
                     return true;
                 case MotionEvent.ACTION_MOVE:
+                    float deltaX = event.getRawX() - downX;
+                    float deltaY = event.getRawY() - downY;
+                    if (Math.hypot(deltaX, deltaY) > touchSlop) moved = true;
                     overlayParams.x = startX + Math.round(event.getRawX() - downX);
                     overlayParams.y = startY + Math.round(event.getRawY() - downY);
                     windows.updateViewLayout(overlay, overlayParams);
                     return true;
                 case MotionEvent.ACTION_UP:
-                    appendDebug("User action: overlay moved to x=" + overlayParams.x
-                            + ", y=" + overlayParams.y);
-                    view.performClick();
+                    if (moved) {
+                        appendDebug("User action: overlay moved to x=" + overlayParams.x
+                                + ", y=" + overlayParams.y);
+                    } else {
+                        view.performClick();
+                    }
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
                     return true;
                 default:
                     return false;

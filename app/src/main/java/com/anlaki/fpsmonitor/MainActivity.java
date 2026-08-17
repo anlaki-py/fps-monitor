@@ -18,6 +18,7 @@ import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -34,6 +35,8 @@ public final class MainActivity extends Activity {
     private Button loggingToggle;
     private TextView status;
     private TextView target;
+    private TextView overlaySizeLabel;
+    private SeekBar overlaySize;
     private boolean startAfterPermission;
 
     private final Shizuku.OnRequestPermissionResultListener permissionListener =
@@ -99,6 +102,34 @@ public final class MainActivity extends Activity {
             refreshUi();
             show("Debug logging " + (enabled ? "enabled" : "disabled"));
         });
+
+        overlaySizeLabel = new TextView(this);
+        overlaySizeLabel.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams sizeLabelParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sizeLabelParams.topMargin = dp(18);
+        root.addView(overlaySizeLabel, sizeLabelParams);
+
+        overlaySize = new SeekBar(this);
+        overlaySize.setMin(MonitorService.OVERLAY_SCALE_MIN);
+        overlaySize.setMax(MonitorService.OVERLAY_SCALE_MAX);
+        overlaySize.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress,
+                                                     boolean fromUser) {
+                overlaySizeLabel.setText("Overlay size: " + progress + "%");
+            }
+
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                int scale = seekBar.getProgress();
+                getSharedPreferences("state", MODE_PRIVATE).edit()
+                        .putInt(MonitorService.PREF_OVERLAY_SCALE, scale).apply();
+                setMonitorScale(scale);
+            }
+        });
+        root.addView(overlaySize, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         setContentView(root);
         refreshUi();
@@ -256,6 +287,14 @@ public final class MainActivity extends Activity {
         startService(intent);
     }
 
+    private void setMonitorScale(int scale) {
+        if (!isRunning()) return;
+        Intent intent = new Intent(this, MonitorService.class)
+                .setAction(MonitorService.ACTION_SET_SCALE)
+                .putExtra(MonitorService.EXTRA_SCALE, scale);
+        startService(intent);
+    }
+
     private void refreshUi() {
         boolean running = isRunning();
         status.setText(running ? "Monitoring is running" : "Monitoring is stopped");
@@ -268,6 +307,10 @@ public final class MainActivity extends Activity {
                 : "Target: " + label + "\n" + packageName);
         loggingToggle.setText(preferences.getBoolean("debug_logging_enabled", true)
                 ? "Turn off debug logging" : "Turn on debug logging");
+        int scale = preferences.getInt(MonitorService.PREF_OVERLAY_SCALE,
+                MonitorService.OVERLAY_SCALE_DEFAULT);
+        overlaySize.setProgress(scale);
+        overlaySizeLabel.setText("Overlay size: " + scale + "%");
     }
 
     private Button addButton(LinearLayout root, String text) {

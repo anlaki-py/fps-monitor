@@ -10,8 +10,9 @@ foreground app using SurfaceFlinger TimeStats through Shizuku.
 3. Open **FPS Monitor** and press **Start**.
 4. Grant Shizuku, overlay, and notification permissions when requested.
 5. Open a game or app. Drag the FPS button to move it.
-6. If the foreground app exposes multiple matching layers, select one directly
-   in the overlay or leave **Auto** selected.
+6. Tap the FPS button to open its options. Select a currently available layer
+   or leave **Auto** selected, and use the size slider to resize the overlay.
+   Tap the FPS button again to close the options.
 
 You can also press **Select app** and choose a launcher activity. In that mode,
 the monitor always filters SurfaceFlinger layers for the selected package and
