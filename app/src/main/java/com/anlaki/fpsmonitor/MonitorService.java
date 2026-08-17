@@ -28,6 +28,7 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 
@@ -56,6 +57,10 @@ public final class MonitorService extends Service {
     public static final int OVERLAY_SCALE_DEFAULT = 100;
     private static final String CHANNEL_ID = "monitor";
     private static final int NOTIFICATION_ID = 1;
+    private static final int OPTIONS_PANEL_WIDTH_DP = 320;
+    private static final int OPTIONS_PANEL_HEIGHT_DP = 420;
+    private static final int OPTIONS_SCREEN_MARGIN_DP = 24;
+    private static final int OPTIONS_VERTICAL_RESERVED_DP = 120;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService worker;
@@ -73,7 +78,6 @@ public final class MonitorService extends Service {
     private String selectedLayer;
     private List<String> shownLayerKeys = new ArrayList<>();
     private boolean optionsExpanded;
-    private int overlayScalePercent = OVERLAY_SCALE_DEFAULT;
     private int touchSlop;
     private boolean stopping;
     private boolean binding;
@@ -320,7 +324,7 @@ public final class MonitorService extends Service {
         automatic.setText("Auto");
         automatic.setId(View.generateViewId());
         automatic.setTag(null);
-        applyRadioScale(automatic);
+        styleLayerChoice(automatic);
         layerChoices.addView(automatic);
         if (selectedLayer == null) automatic.setChecked(true);
 
@@ -330,7 +334,7 @@ public final class MonitorService extends Service {
             item.setTag(layer.stableName);
             double fps = TimeStatsParser.displayFps(layer.fps, displayRefreshRate());
             item.setText(layer.shortName() + String.format(Locale.US, "  %.1f", fps));
-            applyRadioScale(item);
+            styleLayerChoice(item);
             if (layer.stableName.equals(selectedLayer)) item.setChecked(true);
             layerChoices.addView(item);
         }
@@ -350,6 +354,18 @@ public final class MonitorService extends Service {
         fpsButton = new Button(this);
         fpsButton.setText("Connecting…");
         fpsButton.setAllCaps(false);
+        fpsButton.setTextColor(Color.WHITE);
+        fpsButton.setGravity(Gravity.CENTER);
+        fpsButton.setIncludeFontPadding(false);
+        fpsButton.setMinWidth(0);
+        fpsButton.setMinimumWidth(0);
+        fpsButton.setMinHeight(0);
+        fpsButton.setMinimumHeight(0);
+        GradientDrawable fpsBackground = new GradientDrawable();
+        fpsBackground.setColor(0xE6000000);
+        fpsBackground.setCornerRadius(dp(999));
+        fpsBackground.setStroke(dp(1), 0x99FFFFFF);
+        fpsButton.setBackground(fpsBackground);
         fpsButton.setOnClickListener(view -> toggleOptionsPanel());
         overlay.addView(fpsButton);
 
@@ -375,6 +391,20 @@ public final class MonitorService extends Service {
             }
         });
 
+        LinearLayout optionsContent = new LinearLayout(this);
+        optionsContent.setOrientation(LinearLayout.VERTICAL);
+        optionsContent.addView(layerChoices);
+        optionsContent.addView(overlaySizeLabel);
+        optionsContent.addView(overlaySizeSlider, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
+
+        ScrollView optionsScroll = new ScrollView(this);
+        optionsScroll.setFillViewport(true);
+        optionsScroll.setVerticalScrollBarEnabled(true);
+        optionsScroll.setScrollbarFadingEnabled(false);
+        optionsScroll.addView(optionsContent, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+
         optionsPanel = new LinearLayout(this);
         optionsPanel.setOrientation(LinearLayout.VERTICAL);
         optionsPanel.setVisibility(View.GONE);
@@ -384,9 +414,15 @@ public final class MonitorService extends Service {
         panelBackground.setCornerRadius(dp(10));
         panelBackground.setStroke(dp(1), 0x99FFFFFF);
         optionsPanel.setBackground(panelBackground);
-        optionsPanel.addView(layerChoices);
-        optionsPanel.addView(overlaySizeLabel);
-        optionsPanel.addView(overlaySizeSlider);
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int panelWidth = OverlayGeometry.fitPanelSize(dp(OPTIONS_PANEL_WIDTH_DP),
+                screenWidth, dp(OPTIONS_SCREEN_MARGIN_DP));
+        int panelHeight = OverlayGeometry.fitPanelSize(dp(OPTIONS_PANEL_HEIGHT_DP),
+                screenHeight, dp(OPTIONS_VERTICAL_RESERVED_DP));
+        optionsPanel.addView(optionsScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT));
+        optionsPanel.setLayoutParams(new LinearLayout.LayoutParams(panelWidth, panelHeight));
         overlay.addView(optionsPanel);
 
         overlayParams = new WindowManager.LayoutParams(
@@ -411,6 +447,7 @@ public final class MonitorService extends Service {
     private void toggleOptionsPanel() {
         optionsExpanded = !optionsExpanded;
         optionsPanel.setVisibility(optionsExpanded ? View.VISIBLE : View.GONE);
+        overlay.post(this::keepOverlayOnScreen);
         appendDebug("User action: overlay options " + (optionsExpanded ? "opened" : "closed")
                 + "; available layers=" + Math.max(0, layerChoices.getChildCount() - 1));
     }
@@ -418,33 +455,40 @@ public final class MonitorService extends Service {
     private void setOverlayScale(int requestedPercent) {
         int scale = Math.max(OVERLAY_SCALE_MIN, Math.min(OVERLAY_SCALE_MAX, requestedPercent));
         overlaySizeSlider.setProgress(scale);
-        overlayScalePercent = scale;
         getSharedPreferences("state", MODE_PRIVATE).edit()
-                .putInt(PREF_OVERLAY_SCALE, overlayScalePercent).apply();
-        float factor = overlayScalePercent / 100f;
+                .putInt(PREF_OVERLAY_SCALE, scale).apply();
+        float factor = scale / 100f;
         fpsButton.setTextSize(14f * factor);
-        fpsButton.setMinimumHeight(dp(Math.round(48f * factor)));
-        fpsButton.setPadding(dp(Math.round(16f * factor)), 0,
-                dp(Math.round(16f * factor)), 0);
-        for (int index = 0; index < layerChoices.getChildCount(); index++) {
-            applyRadioScale((RadioButton) layerChoices.getChildAt(index));
-        }
-        overlaySizeLabel.setText("Overlay size: " + overlayScalePercent + "%");
-        overlaySizeLabel.setTextSize(14f * factor);
-        overlaySizeSlider.setMinimumHeight(dp(Math.round(40f * factor)));
-        overlaySizeSlider.setLayoutParams(new LinearLayout.LayoutParams(
-                dp(Math.round(190f * factor)), LinearLayout.LayoutParams.WRAP_CONTENT));
+        int horizontalPadding = dp(OverlayGeometry.scaleDimension(16, scale));
+        int verticalPadding = dp(OverlayGeometry.scaleDimension(12, scale));
+        fpsButton.setPadding(horizontalPadding, verticalPadding,
+                horizontalPadding, verticalPadding);
+        overlaySizeLabel.setText("Overlay size: " + scale + "%");
         overlay.requestLayout();
-        appendDebug("User action: overlay size=" + overlayScalePercent + "%");
+        overlay.post(this::keepOverlayOnScreen);
+        appendDebug("User action: overlay size=" + scale + "%");
     }
 
-    private void applyRadioScale(RadioButton item) {
-        float factor = overlayScalePercent / 100f;
+    private void styleLayerChoice(RadioButton item) {
         item.setTextColor(Color.WHITE);
-        item.setTextSize(14f * factor);
-        item.setMinimumHeight(dp(Math.round(40f * factor)));
-        item.setPadding(dp(Math.round(8f * factor)), 0,
-                dp(Math.round(8f * factor)), 0);
+        item.setTextSize(16f);
+        item.setMinimumHeight(dp(52));
+        item.setPadding(dp(10), dp(4), dp(10), dp(4));
+    }
+
+    private void keepOverlayOnScreen() {
+        if (overlay == null || overlayParams == null || !overlay.isAttachedToWindow()) return;
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int clampedX = OverlayGeometry.clampPosition(
+                overlayParams.x, overlay.getWidth(), screenWidth);
+        int clampedY = OverlayGeometry.clampPosition(
+                overlayParams.y, overlay.getHeight(), screenHeight);
+        if (clampedX != overlayParams.x || clampedY != overlayParams.y) {
+            overlayParams.x = clampedX;
+            overlayParams.y = clampedY;
+            windows.updateViewLayout(overlay, overlayParams);
+        }
     }
 
     private final class DragListener implements View.OnTouchListener {
@@ -471,6 +515,7 @@ public final class MonitorService extends Service {
                     return true;
                 case MotionEvent.ACTION_UP:
                     if (moved) {
+                        keepOverlayOnScreen();
                         appendDebug("User action: overlay moved to x=" + overlayParams.x
                                 + ", y=" + overlayParams.y);
                     } else {
