@@ -31,6 +31,7 @@ public final class MainActivity extends Activity {
     private static final int PICK_APP_REQUEST = 13;
 
     private Button toggle;
+    private Button loggingToggle;
     private TextView status;
     private TextView target;
     private boolean startAfterPermission;
@@ -81,12 +82,23 @@ public final class MainActivity extends Activity {
         automatic.setOnClickListener(v -> {
             getSharedPreferences("state", MODE_PRIVATE).edit()
                     .remove("target_package").remove("target_label").apply();
+            noteMonitor("automatic app detection selected");
             refreshUi();
             show("Automatic detection enabled");
         });
 
         Button debug = addButton(root, "View debug log");
         debug.setOnClickListener(v -> showDebugLog());
+
+        loggingToggle = addButton(root, "Turn off debug logging");
+        loggingToggle.setOnClickListener(v -> {
+            SharedPreferences preferences = getSharedPreferences("state", MODE_PRIVATE);
+            boolean enabled = !preferences.getBoolean("debug_logging_enabled", true);
+            preferences.edit().putBoolean("debug_logging_enabled", enabled).apply();
+            setMonitorLogging(enabled);
+            refreshUi();
+            show("Debug logging " + (enabled ? "enabled" : "disabled"));
+        });
 
         setContentView(root);
         refreshUi();
@@ -177,13 +189,16 @@ public final class MainActivity extends Activity {
                 .putString("target_package", packageName)
                 .putString("target_label", label)
                 .apply();
+        noteMonitor("fixed target selected: " + label + " (" + packageName + ")");
         refreshUi();
         show("Monitoring " + label);
     }
 
     private void showDebugLog() {
-        String log = getSharedPreferences("state", MODE_PRIVATE)
-                .getString("debug_log", "No diagnostics yet. Start the monitor first.");
+        SharedPreferences preferences = getSharedPreferences("state", MODE_PRIVATE);
+        String log = preferences.getBoolean("debug_logging_enabled", true)
+                ? preferences.getString("debug_log", "No diagnostics yet. Start the monitor first.")
+                : "Debug logging is turned off.";
         TextView text = new TextView(this);
         int pad = dp(16);
         text.setPadding(pad, pad, pad, pad);
@@ -225,6 +240,22 @@ public final class MainActivity extends Activity {
         return getSharedPreferences("state", MODE_PRIVATE).getBoolean("running", false);
     }
 
+    private void noteMonitor(String note) {
+        if (!isRunning()) return;
+        Intent intent = new Intent(this, MonitorService.class)
+                .setAction(MonitorService.ACTION_NOTE)
+                .putExtra(MonitorService.EXTRA_NOTE, note);
+        startService(intent);
+    }
+
+    private void setMonitorLogging(boolean enabled) {
+        if (!isRunning()) return;
+        Intent intent = new Intent(this, MonitorService.class)
+                .setAction(MonitorService.ACTION_SET_LOGGING)
+                .putExtra(MonitorService.EXTRA_ENABLED, enabled);
+        startService(intent);
+    }
+
     private void refreshUi() {
         boolean running = isRunning();
         status.setText(running ? "Monitoring is running" : "Monitoring is stopped");
@@ -235,6 +266,8 @@ public final class MainActivity extends Activity {
         target.setText(packageName == null
                 ? "Target: automatic foreground app"
                 : "Target: " + label + "\n" + packageName);
+        loggingToggle.setText(preferences.getBoolean("debug_logging_enabled", true)
+                ? "Turn off debug logging" : "Turn on debug logging");
     }
 
     private Button addButton(LinearLayout root, String text) {

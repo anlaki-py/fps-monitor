@@ -3,12 +3,8 @@ package com.anlaki.fpsmonitor;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 final class TimeStatsParser {
-    private static final Pattern PACKAGE = Pattern.compile(
-            "(?:^|[\\s{])([A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)(?:/|(?=\\s|}|$))");
     private static final String[] FOCUS_MARKERS = {
             "mCurrentFocus", "mFocusedWindow", "mFocusedApp", "topResumedActivity",
             "mResumedActivity", "ResumedActivity", "topActivity"
@@ -17,13 +13,86 @@ final class TimeStatsParser {
     static String foregroundPackage(String dump) {
         if (dump == null) return null;
         for (String marker : FOCUS_MARKERS) {
-            for (String line : dump.split("\\R")) {
-                if (!line.contains(marker)) continue;
-                Matcher match = PACKAGE.matcher(line);
-                if (match.find()) return match.group(1);
+            int searchFrom = 0;
+            while (searchFrom < dump.length()) {
+                int markerAt = dump.indexOf(marker, searchFrom);
+                if (markerAt < 0) break;
+                int lineEnd = dump.indexOf('\n', markerAt);
+                if (lineEnd < 0) lineEnd = dump.length();
+                String packageName = componentPackage(dump, markerAt + marker.length(), lineEnd);
+                if (packageName != null) return packageName;
+                searchFrom = lineEnd + 1;
             }
         }
         return null;
+    }
+
+    static double displayFps(double measuredFps, double displayRefreshRate) {
+        if (!(measuredFps > 0.0) || !(displayRefreshRate > 0.0)
+                || measuredFps <= displayRefreshRate) {
+            return measuredFps;
+        }
+        double refreshIntervalMs = 1000.0 / displayRefreshRate;
+        double integerIntervalMs = Math.floor(refreshIntervalMs);
+        if (integerIntervalMs < 1.0) return measuredFps;
+
+        // TimeStats bins present-to-present intervals in whole milliseconds. For
+        // example, 8 ms becomes 125 FPS even when the display is actually 120 Hz.
+        double quantizedCeiling = 1000.0 / integerIntervalMs;
+        return measuredFps <= quantizedCeiling * 1.01
+                ? displayRefreshRate : measuredFps;
+    }
+
+    private static String componentPackage(String text, int start, int end) {
+        int slash = text.indexOf('/', start);
+        while (slash >= 0 && slash < end) {
+            int packageEnd = slash;
+            while (packageEnd > start && Character.isWhitespace(text.charAt(packageEnd - 1))) {
+                packageEnd--;
+            }
+            int packageStart = packageEnd;
+            while (packageStart > start && isPackageCharacter(text.charAt(packageStart - 1))) {
+                packageStart--;
+            }
+            if (isPackageName(text, packageStart, packageEnd)) {
+                return text.substring(packageStart, packageEnd);
+            }
+            slash = text.indexOf('/', slash + 1);
+        }
+
+        // Some OEM dumps omit the activity after the package. Scan tokens without
+        // regex backtracking so even unusually long WindowManager lines stay bounded.
+        int position = start;
+        String candidate = null;
+        while (position < end) {
+            while (position < end && !isPackageCharacter(text.charAt(position))) position++;
+            int tokenStart = position;
+            while (position < end && isPackageCharacter(text.charAt(position))) position++;
+            if (isPackageName(text, tokenStart, position)) {
+                candidate = text.substring(tokenStart, position);
+            }
+        }
+        return candidate;
+    }
+
+    private static boolean isPackageCharacter(char value) {
+        return value == '.' || value == '_' || Character.isLetterOrDigit(value);
+    }
+
+    private static boolean isPackageName(String text, int start, int end) {
+        if (start >= end || !Character.isLetter(text.charAt(start))
+                || text.charAt(end - 1) == '.') return false;
+        boolean dot = false;
+        for (int index = start; index < end; index++) {
+            char value = text.charAt(index);
+            if (value == '.') {
+                if (index == start || text.charAt(index - 1) == '.') return false;
+                dot = true;
+            } else if (value != '_' && !Character.isLetterOrDigit(value)) {
+                return false;
+            }
+        }
+        return dot;
     }
 
     static String diagnosticLines(String dump, int limit) {

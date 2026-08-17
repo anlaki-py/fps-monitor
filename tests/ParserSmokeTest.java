@@ -12,6 +12,23 @@ public final class ParserSmokeTest {
         if (!"com.fallback.game".equals(TimeStatsParser.foregroundPackage(activity))) {
             throw new AssertionError("activity fallback parsing failed");
         }
+        StringBuilder hugeWindowDump = new StringBuilder("unrelated=");
+        for (int i = 0; i < 500_000; i++) hugeWindowDump.append('a');
+        hugeWindowDump.append("\nmCurrentFocus=Window{abcd u0 com.large.game/.MainActivity}\n");
+        long parseStarted = System.nanoTime();
+        if (!"com.large.game".equals(
+                TimeStatsParser.foregroundPackage(hugeWindowDump.toString()))) {
+            throw new AssertionError("large foreground dump parsing failed");
+        }
+        if (System.nanoTime() - parseStarted > 1_000_000_000L) {
+            throw new AssertionError("large foreground dump parsing was unexpectedly slow");
+        }
+        if (TimeStatsParser.displayFps(125.186, 120.0) != 120.0
+                || TimeStatsParser.displayFps(60.569, 60.0) != 60.0
+                || TimeStatsParser.displayFps(90.0, 120.0) != 90.0
+                || TimeStatsParser.displayFps(135.0, 120.0) != 135.0) {
+            throw new AssertionError("display-aware FPS correction failed");
+        }
 
         String stats = "layerName = com.game.test/com.game.MainActivity#20\n"
                 + "totalFrames = 10\naverageFPS = 20.0\n"

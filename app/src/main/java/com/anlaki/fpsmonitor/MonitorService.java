@@ -11,11 +11,13 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.ServiceConnection;
 import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
 import android.view.Gravity;
+import android.view.Display;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
@@ -28,6 +30,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +39,10 @@ import rikka.shizuku.Shizuku;
 
 public final class MonitorService extends Service {
     public static final String ACTION_STOP = "com.anlaki.fpsmonitor.STOP";
+    public static final String ACTION_NOTE = "com.anlaki.fpsmonitor.NOTE";
+    public static final String ACTION_SET_LOGGING = "com.anlaki.fpsmonitor.SET_LOGGING";
+    public static final String EXTRA_NOTE = "note";
+    public static final String EXTRA_ENABLED = "enabled";
     private static final String CHANNEL_ID = "monitor";
     private static final int NOTIFICATION_ID = 1;
 
@@ -48,20 +55,48 @@ public final class MonitorService extends Service {
     private Button fpsButton;
     private RadioGroup layerChoices;
     private String currentPackage;
+    private String lastLoggedForeground;
     private String selectedLayer;
     private List<String> shownLayerKeys = new ArrayList<>();
     private boolean stopping;
+    private boolean binding;
+    private volatile boolean loggingEnabled;
+    private int bindAttempts;
     private final StringBuilder debugLog = new StringBuilder();
     private long lastDebugWrite;
 
+    private final Runnable connectTimeout = () -> {
+        if (shell != null || stopping) return;
+        appendDebug("Shizuku UserService connection timed out; attempt=" + bindAttempts
+                + "; binder=" + Shizuku.pingBinder()
+                + "; permission=" + safePermissionState());
+        if (bindAttempts < 3) {
+            binding = false;
+            bindShell();
+        } else {
+            binding = false;
+            fpsButton.setText("Shizuku service unavailable");
+        }
+    };
+
+    private final Shizuku.OnBinderReceivedListener binderReceivedListener = () -> {
+        appendDebug("Shizuku binder received; rebinding UserService");
+        if (shell == null && !stopping) bindShell();
+    };
+
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            main.removeCallbacks(connectTimeout);
+            binding = false;
             shell = IShellService.Stub.asInterface(binder);
-            appendDebug("Shizuku UserService connected; uid=" + safeShizukuUid());
+            appendDebug("Shizuku UserService connected; component=" + name.flattenToShortString()
+                    + "; uid=" + safeShizukuUid());
+            fpsButton.setText("Starting monitor…");
             startSampling();
         }
         @Override public void onServiceDisconnected(ComponentName name) {
             shell = null;
+            binding = false;
             appendDebug("Shizuku UserService disconnected");
             main.post(() -> fpsButton.setText("Shizuku disconnected"));
         }
@@ -73,37 +108,73 @@ public final class MonitorService extends Service {
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, notification());
         createOverlay();
-        getSharedPreferences("state", MODE_PRIVATE).edit().remove("debug_log").apply();
-        appendDebug("FPS Monitor 1.1.0 started; binder=" + Shizuku.pingBinder()
-                + "; uid=" + safeShizukuUid());
+        SharedPreferences state = getSharedPreferences("state", MODE_PRIVATE);
+        loggingEnabled = state.getBoolean("debug_logging_enabled", true);
+        state.edit().remove("debug_log").apply();
+        appendDebug("FPS Monitor " + BuildConfig.VERSION_NAME + " started; binder=" + Shizuku.pingBinder()
+                + "; uid=" + safeShizukuUid()
+                + "; permission=" + safePermissionState());
+        Shizuku.addBinderReceivedListenerSticky(binderReceivedListener, main);
         bindShell();
         getSharedPreferences("state", MODE_PRIVATE).edit().putBoolean("running", true).apply();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_STOP.equals(intent.getAction())) stopSelf();
+        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            appendDebug("User action: stop monitor");
+            stopSelf();
+        } else if (intent != null && ACTION_NOTE.equals(intent.getAction())) {
+            appendDebug("User action: " + intent.getStringExtra(EXTRA_NOTE));
+        } else if (intent != null && ACTION_SET_LOGGING.equals(intent.getAction())) {
+            setDebugLogging(intent.getBooleanExtra(EXTRA_ENABLED, true));
+        }
         return START_NOT_STICKY;
     }
 
     private void bindShell() {
+        if (stopping || shell != null || binding) return;
         if (!Shizuku.pingBinder()) {
+            appendDebug("Shizuku binder is not available");
             fpsButton.setText("Start Shizuku");
             return;
         }
-        Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(
-                new ComponentName(this, ShellService.class))
+        if (safePermissionState() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            appendDebug("Shizuku permission is not granted; cannot bind UserService");
+            fpsButton.setText("Grant Shizuku permission");
+            return;
+        }
+        binding = true;
+        bindAttempts++;
+        try {
+            appendDebug("Binding Shizuku UserService; attempt=" + bindAttempts);
+            Shizuku.bindUserService(userServiceArgs(), connection);
+            main.removeCallbacks(connectTimeout);
+            main.postDelayed(connectTimeout, 8000);
+        } catch (Throwable error) {
+            binding = false;
+            appendDebug("ERROR binding Shizuku UserService: " + error);
+            fpsButton.setText("Shizuku bind failed");
+        }
+    }
+
+    private Shizuku.UserServiceArgs userServiceArgs() {
+        return new Shizuku.UserServiceArgs(new ComponentName(this, ShellService.class))
                 .processNameSuffix("fps")
                 .debuggable(BuildConfig.DEBUG)
-                .version(2)
-                .daemon(false);
-        Shizuku.bindUserService(args, connection);
+                .version(3)
+                .daemon(true);
     }
 
     private void startSampling() {
+        if (worker != null) return;
         worker = Executors.newSingleThreadScheduledExecutor();
         worker.execute(() -> {
-            try { shell.run("enable"); }
+            try {
+                runCommand(shell, "enable");
+                appendDebug("TimeStats enabled; beginning 500 ms sampling");
+                main.post(() -> fpsButton.setText("Collecting data…"));
+            }
             catch (Exception e) { showError(e); }
         });
         worker.scheduleWithFixedDelay(this::sample, 500, 500, TimeUnit.MILLISECONDS);
@@ -121,22 +192,51 @@ public final class MonitorService extends Service {
             String source = "fixed app selection";
 
             if (foreground == null || foreground.isEmpty()) {
-                windowDump = service.run("foregroundWindow");
+                windowDump = runCommand(service, "foregroundWindow");
+                long parseStarted = System.currentTimeMillis();
                 foreground = TimeStatsParser.foregroundPackage(windowDump);
+                appendDebug("Foreground parse completed; elapsed="
+                        + (System.currentTimeMillis() - parseStarted) + " ms; result=" + foreground);
                 source = "WindowManager";
                 if (foreground == null) {
-                    activityDump = service.run("foregroundActivity");
+                    activityDump = runCommand(service, "foregroundActivity");
+                    parseStarted = System.currentTimeMillis();
                     foreground = TimeStatsParser.foregroundPackage(activityDump);
+                    appendDebug("Activity fallback parse completed; elapsed="
+                            + (System.currentTimeMillis() - parseStarted) + " ms; result=" + foreground);
                     source = "ActivityManager fallback";
                 }
             }
-            String dump = service.run("sample");
+            if (!Objects.equals(foreground, lastLoggedForeground)) {
+                appendDebug("Foreground/target app changed: " + lastLoggedForeground
+                        + " -> " + foreground + "; source=" + source);
+                lastLoggedForeground = foreground;
+            }
+            String dump = runCommand(service, "sample");
             List<LayerStat> layers = TimeStatsParser.layers(dump, foreground);
-            recordSample(source, fixedPackage, foreground, windowDump, activityDump, dump, layers);
+            if (loggingEnabled) {
+                recordSample(source, fixedPackage, foreground, windowDump, activityDump, dump, layers);
+            }
             String targetPackage = foreground;
             main.post(() -> display(targetPackage, layers));
         } catch (Exception e) {
             showError(e);
+        }
+    }
+
+    private String runCommand(IShellService service, String operation) throws RemoteException {
+        long started = System.currentTimeMillis();
+        appendDebug("Command started: " + operation);
+        try {
+            String result = service.run(operation);
+            appendDebug("Command completed: " + operation + "; elapsed="
+                    + (System.currentTimeMillis() - started) + " ms; bytes="
+                    + (result == null ? 0 : result.length()));
+            return result;
+        } catch (RemoteException error) {
+            appendDebug("ERROR command failed: " + operation + "; elapsed="
+                    + (System.currentTimeMillis() - started) + " ms; " + error.getMessage());
+            throw error;
         }
     }
 
@@ -166,8 +266,20 @@ public final class MonitorService extends Service {
                 }
             }
         }
-        fpsButton.setText(String.format(Locale.US, "%.1f FPS", chosen.fps));
+        double shownFps = TimeStatsParser.displayFps(chosen.fps, displayRefreshRate());
+        if (Math.abs(shownFps - chosen.fps) > 0.01) {
+            appendDebug(String.format(Locale.US,
+                    "Display correction: measured=%.3f; refresh=%.3f; shown=%.3f",
+                    chosen.fps, displayRefreshRate(), shownFps));
+        }
+        fpsButton.setText(String.format(Locale.US, "%.1f FPS", shownFps));
         updateChoices(layers);
+    }
+
+    private double displayRefreshRate() {
+        DisplayManager manager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        Display display = manager == null ? null : manager.getDisplay(Display.DEFAULT_DISPLAY);
+        return display == null ? 0.0 : display.getRefreshRate();
     }
 
     private void updateChoices(List<LayerStat> layers) {
@@ -204,6 +316,8 @@ public final class MonitorService extends Service {
         layerChoices.setOnCheckedChangeListener((group, checkedId) -> {
             View checked = group.findViewById(checkedId);
             selectedLayer = checked == null ? null : (String) checked.getTag();
+            appendDebug("User action: layer selection="
+                    + (selectedLayer == null ? "Auto" : selectedLayer));
         });
     }
 
@@ -255,6 +369,8 @@ public final class MonitorService extends Service {
                     windows.updateViewLayout(overlay, overlayParams);
                     return true;
                 case MotionEvent.ACTION_UP:
+                    appendDebug("User action: overlay moved to x=" + overlayParams.x
+                            + ", y=" + overlayParams.y);
                     view.performClick();
                     return true;
                 default:
@@ -303,6 +419,7 @@ public final class MonitorService extends Service {
     }
 
     private synchronized void appendDebug(String message) {
+        if (!loggingEnabled) return;
         String timestamp = String.format(Locale.US, "%1$tF %1$tT.%1$tL", new Date());
         debugLog.append("\n=== ").append(timestamp).append(" ===\n")
                 .append(message).append('\n');
@@ -315,13 +432,34 @@ public final class MonitorService extends Service {
     }
 
     private synchronized void persistDebug() {
+        if (!loggingEnabled) return;
         getSharedPreferences("state", MODE_PRIVATE).edit()
                 .putString("debug_log", debugLog.toString().trim()).apply();
+    }
+
+    private synchronized void setDebugLogging(boolean enabled) {
+        if (loggingEnabled == enabled) return;
+        if (!enabled) {
+            appendDebug("User action: debug logging disabled");
+            persistDebug();
+            loggingEnabled = false;
+            debugLog.setLength(0);
+            getSharedPreferences("state", MODE_PRIVATE).edit().remove("debug_log").apply();
+        } else {
+            loggingEnabled = true;
+            appendDebug("User action: debug logging enabled");
+            persistDebug();
+        }
     }
 
     private int safeShizukuUid() {
         try { return Shizuku.getUid(); }
         catch (Exception ignored) { return -1; }
+    }
+
+    private int safePermissionState() {
+        try { return Shizuku.checkSelfPermission(); }
+        catch (Exception ignored) { return Integer.MIN_VALUE; }
     }
 
     private void createNotificationChannel() {
@@ -354,20 +492,23 @@ public final class MonitorService extends Service {
     @Override
     public void onDestroy() {
         stopping = true;
+        main.removeCallbacks(connectTimeout);
+        Shizuku.removeBinderReceivedListener(binderReceivedListener);
         appendDebug("Monitor stopping");
         persistDebug();
         if (worker != null) {
-            worker.execute(() -> {
-                try { if (shell != null) shell.run("disable"); }
-                catch (Exception ignored) {}
-            });
-            worker.shutdown();
+            worker.shutdownNow();
+            try { worker.awaitTermination(1500, TimeUnit.MILLISECONDS); }
+            catch (InterruptedException error) { Thread.currentThread().interrupt(); }
         }
+        if (shell != null) {
+            try { runCommand(shell, "disable"); }
+            catch (Exception ignored) {}
+        }
+        persistDebug();
         if (overlay != null) windows.removeView(overlay);
         try {
-            Shizuku.unbindUserService(new Shizuku.UserServiceArgs(
-                    new ComponentName(this, ShellService.class)).processNameSuffix("fps"),
-                    connection, true);
+            Shizuku.unbindUserService(userServiceArgs(), connection, true);
         } catch (Exception ignored) {}
         getSharedPreferences("state", MODE_PRIVATE).edit().putBoolean("running", false).apply();
         super.onDestroy();
