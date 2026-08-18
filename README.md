@@ -38,8 +38,8 @@ largest recent frame count. A static screen may correctly show `Idle / no data`.
 - UI: platform Android Views only
 - External dependencies: Shizuku API and provider only
 
-This method is OEM-dependent. It was designed from measurements made on a
-Xiaomi 12T running Android 15 / HyperOS 2.
+This [method](https://gist.github.com/anlaki-py/d9c8cf06cd54149d522adb8e665bfbd0) is OEM-dependent. It was designed from measurements made on a
+Xiaomi 12T running Android 15 / HyperOS 2. 
 
 ## Build
 
